@@ -33,6 +33,8 @@ create_schemas → bronze_ingest → bronze_backfill → silver_transform → go
 ```
 
 ## What the Dashboard Shows
+[AgentTraceOps  Tool Reliability Dashboard-2026-03-29-10-39.pdf](https://github.com/user-attachments/files/26331969/AgentTraceOps.Tool.Reliability.Dashboard-2026-03-29-10-39.pdf)
+
 
 Four KPI tiles at the top: traces ingested (119.29K), average match rate (47.9%), zero match rate (52.07%), and perfect match rate (47.85%).
 
