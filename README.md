@@ -1,154 +1,102 @@
-# TraceOps
-# AgentTraceOps Lakehouse
+# AgentTraceOps
 
-**AI agent traces are messy logs. This pipeline turns them into operational intelligence.**
+A Databricks lakehouse pipeline that ingests 119K AI agent traces, parses tool-call behavior, and answers one question: **when agents have access to the right tools, do they actually use them?**
 
-## The Finding
+The answer: **less than half the time.**
 
-| Metric | Value |
-|--------|-------|
-| Traces analyzed | 119,287 |
-| Avg tool match rate | 47.9% |
-| Perfect match (100%) | 47.85% of traces |
-| Zero match (0%) | 52.07% of traces |
-| Top failure source | Dictionary server (~40K+ affected traces) |
-| Data source | Toucan-1.5M SFT subset |
+## What I Found
 
-Agents either get every tool right or every tool wrong — almost nothing in between. Single-tool traces succeed 99.9% of the time, but multi-tool coordination drops accuracy to ~25%. Initial analysis on 39K traces showed a 78.5% match rate; scaling to 119K revealed the true rate is 47.9%.
+I analyzed 119,287 agent execution traces from the Toucan-1.5M dataset. Each trace records a user question, the tools an agent had available, the tools it was expected to use, and the full conversation of what it actually did.
 
-## Architecture
+**Finding 1 — Agents either nail it or completely miss.** 47.85% of traces achieved a perfect tool match. 52.07% achieved zero match. Only 0.08% fell in between. There is almost no middle ground — agents don't partially fail, they fail entirely.
+
+**Finding 2 — Single-tool tasks are nearly flawless. Multi-tool tasks break down.** When an agent only needs one tool, it picks the right one 99.9% of the time. The moment it needs two or more tools, accuracy drops to 25–33%. The failure mode isn't "picking bad tools" — it's coordinating across multiple tools.
+
+**Finding 3 — Certain MCP servers are disproportionately associated with failures.** The dictionary server alone accounted for ~40K failed tool calls. Weather-related servers collectively represent the largest failure cluster. These aren't random — they point to specific tool schemas or descriptions that confuse agents.
+
+**Finding 4 — First impressions lie.** My initial 39K-row sample showed a 78.5% match rate. After scaling to 119K rows, the real rate was 47.9%. The first shard was unrepresentatively clean.
+
+## How the Pipeline Works
+
+Raw parquet files from Hugging Face go through three layers before becoming dashboard-ready metrics.
+
+**Bronze** stores the raw data exactly as it arrived — 119,287 rows across 3 parquet shards, each tagged with a source label, ingestion timestamp, and run ID. The ingestion is idempotent: running the notebook twice doesn't create duplicates because it checks if each shard's source label already exists before writing.
+
+**Silver** parses the nested JSON in each trace. The `messages` column (a JSON array of user/assistant/tool_call/tool_response objects) gets broken apart to count tool calls, extract tool names, and compare them against the expected tools. A key challenge here: actual tool names include an MCP server prefix (`lyrical-mcp-find_rhymes`) while target tools use short names (`find_rhymes`). I used `endsWith` matching to bridge this gap. Silver processing is incremental — it tracks which UUIDs are already processed and only transforms new Bronze rows.
+
+**Gold** aggregates Silver into four tables: headline KPIs, match rates bucketed by tool complexity, failure patterns grouped by MCP server, and dynamically computed data quality metrics.
+
+The full pipeline is orchestrated as a Databricks Workflow with six tasks running in sequence:
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                    AGENTTRACEOPS PIPELINE                          │
-│                                                                    │
-│  Hugging Face             Databricks              Dashboard        │
-│  (Toucan-1.5M)                                                     │
-│                                                                    │
-│  SFT subset ──►  BRONZE              ──►  4-tile KPI panel         │
-│  3 parquet        toucan_raw               Match Rate by Complexity│
-│  shards           119,287 rows        ──►  Top 10 Failure Servers  │
-│                        │                   DQ Summary Table        │
-│                   SILVER                                           │
-│                   toucan_trace                                     │
-│                   119,287 rows                                     │
-│                   + match_rate                                     │
-│                   + tools_used                                     │
-│                        │                                           │
-│                   GOLD                                             │
-│                   trace_kpis                                       │
-│                   match_by_complexity                               │
-│                   failure_patterns                                  │
-│                   dq_metrics                                       │
-└────────────────────────────────────────────────────────────────────┘
+create_schemas → bronze_ingest → bronze_backfill → silver_transform → gold_kpis → dq_checks
 ```
 
-## Key Findings
+## What the Dashboard Shows
 
-**1. Tool selection is bimodal.** 47.85% of traces achieve perfect tool matches. 52.07% achieve zero matches. Only 0.08% fall in between. Agents don't partially fail — they either nail it or miss entirely.
+Four KPI tiles at the top: traces ingested (119.29K), average match rate (47.9%), zero match rate (52.07%), and perfect match rate (47.85%).
 
-**2. Multi-tool coordination is the weak point.** Single-tool traces: 99.9% match rate. Two-tool traces: ~25%. Three-to-five tools: ~33%. The failure mode isn't picking bad tools — it's coordinating across multiple tools.
+Below that, two charts. The first shows match rate by tool complexity — a steep cliff from single-tool (near 100%) to multi-tool (~25-33%). The second shows the top 10 MCP servers associated with failed traces, with dictionary and weather servers dominating.
 
-**3. Weather and dictionary servers dominate failures.** The dictionary server alone accounts for ~40K+ failed tool calls. Weather-related servers (united-states-weather, weather-forecast-service, weather-api-server, etc.) collectively represent the largest failure cluster.
+At the bottom, a data quality summary table showing all checks passing across 119,287 rows.
 
-**4. Data quality varies across shards.** The first parquet shard showed 78.5% match rate. After loading all three shards, the rate dropped to 47.9% — a reminder that initial samples can be misleading.
+## Engineering Decisions
+
+**Why idempotent ingestion?** Each parquet shard gets a unique `source` label (e.g., `toucan_sft_0001`). Before writing, the notebook checks if that label already exists in Bronze. This means the pipeline is safe to rerun — it won't duplicate data.
+
+**Why schema enforcement?** Bronze reads data with an explicitly defined `StructType` rather than letting Spark infer the schema. If a future shard has different columns, the pipeline fails immediately instead of silently loading mismatched data.
+
+**Why incremental Silver?** Silver uses a `LEFT ANTI JOIN` on UUID to skip rows that are already processed. When new shards are added to Bronze, only the delta flows through Silver — no full reprocessing.
+
+**Why quarantine?** Records that fail JSON parsing get routed to a separate quarantine table instead of being silently dropped. In this dataset zero rows were quarantined, but the mechanism exists for when messier data arrives.
+
+**Why 11 DQ checks?** Automated validation runs across all three layers: null keys, empty messages, UUID uniqueness, match rate ranges, row count reconciliation between layers, and Gold KPI alignment. All 11 pass.
 
 ## Tables
 
-### Bronze Layer
-| Table | Rows | Description |
-|-------|------|-------------|
-| `vadlamani_bronze.toucan_raw` | 119,287 | Raw Toucan SFT traces with ingestion metadata |
+```
+bootcamp_students.vadlamani_bronze
+  └── toucan_raw              119,287 rows    Raw traces + ingestion metadata
 
-### Silver Layer
-| Table | Rows | Description |
-|-------|------|-------------|
-| `vadlamani_silver.toucan_trace` | 119,287 | Parsed traces with tool counts, match rates, parse status |
+bootcamp_students.vadlamani_silver
+  └── toucan_trace            119,287 rows    Parsed traces with match rates
 
-### Gold Layer
-| Table | Description |
-|-------|-------------|
-| `vadlamani_gold.trace_kpis` | Headline metrics: match rates, tool counts, ingestion stats |
-| `vadlamani_gold.match_by_complexity` | Match rate broken down by tool call count buckets |
-| `vadlamani_gold.failure_patterns` | Top MCP servers associated with zero-match traces |
-| `vadlamani_gold.dq_metrics` | Data quality check results per pipeline run |
+bootcamp_students.vadlamani_gold
+  ├── trace_kpis              1 row           Headline operational metrics
+  ├── match_by_complexity     4 rows          Match rate by tool count bucket
+  ├── failure_patterns        50+ rows        Failed calls grouped by MCP server
+  └── dq_metrics              4 rows          Data quality check results
+```
 
-## Gold Table: Data Dictionary
-
-**Table: `vadlamani_gold.trace_kpis`**
-
-| Column | Type | Description |
-|--------|------|-------------|
-| metric_date | DATE | Date the metrics were computed |
-| source_name | STRING | Data source identifier |
-| traces_ingested | LONG | Total traces processed |
-| zero_match_count | LONG | Traces where no target tools were matched |
-| zero_match_pct | DOUBLE | Percentage of zero-match traces |
-| avg_tool_calls_per_trace | DOUBLE | Average number of tool calls per trace |
-| avg_target_tools_per_trace | DOUBLE | Average number of expected tools per trace |
-| avg_available_tools | DOUBLE | Average tools available to the agent |
-| avg_match_rate_pct | DOUBLE | Average tool match rate as percentage |
-| perfect_match_count | LONG | Traces with 100% tool match |
-| perfect_match_pct | DOUBLE | Percentage of perfect-match traces |
-
-## Notebook Execution Order
+## Notebooks
 
 ```
 AgentTraceOps/
-  01_create_schemas.py          ← Creates bronze/silver/gold schemas (run once)
-  02_bronze_toucan_ingest.py    ← Downloads shard 0000, writes to Bronze (idempotent)
-  02b_bronze_backfill.py        ← Downloads shards 0001-0002, appends to Bronze (idempotent)
-  03_explore_bronze.py          ← Data exploration and profiling
-  04_silver_toucan.py           ← Parses traces, computes match rates (incremental)
-  05_gold_kpis.py               ← Aggregates KPIs, complexity, failures, DQ metrics
-  06_dq_checks.py               ← 11 automated DQ checks across all layers
+  01_create_schemas.py              Creates bronze/silver/gold schemas (run once)
+  02_bronze_toucan_ingest.py        Downloads shard 0000 → Bronze (idempotent)
+  02b_bronze_backfill.py            Downloads shards 0001-0002 → Bronze (idempotent)
+  03_explore_bronze.py              Data profiling and exploration
+  04_silver_toucan.py               Parses traces, computes match rates (incremental)
+  05_gold_kpis.py                   Aggregates into KPI, complexity, failure, DQ tables
+  06_dq_checks.py                   11 automated checks across all layers
 ```
 
-Orchestrated via Databricks Workflow: `create_schemas → bronze_ingest → bronze_backfill → silver_transform → gold_kpis → dq_checks`
+## Workarounds I Ran Into
 
-## Pipeline Design Principles
+**Hugging Face datasets library breaks on Databricks Runtime 18.1.** The `load_dataset()` function throws a `maxdepth` error due to a conflict with Databricks' patched `huggingface_hub`. Fix: bypass the library entirely and read parquet files directly from Hugging Face URLs.
 
-**Idempotent ingestion.** Bronze checks if a source has already been loaded before writing. Running the ingestion notebook multiple times never creates duplicates.
+**Spark can't read from local `/tmp/` on Databricks.** Downloaded files land on the driver's local disk, but Spark expects DBFS paths. Fix: `dbutils.fs.cp("file:/tmp/file.parquet", "dbfs:/tmp/file.parquet")` to copy to DBFS before reading.
 
-**Schema enforcement.** Bronze reads data with an explicitly defined schema rather than relying on Spark inference. If upstream data changes shape, the pipeline fails loudly instead of silently ingesting bad data.
+**Tool name prefix mismatch tanks match rates to 0%.** Actual tool call names include the MCP server as a prefix (`lyrical-mcp-find_rhymes`) but target tools are just the short name (`find_rhymes`). `array_intersect` returns zero matches. Fix: use `endsWith()` matching — `"lyrical-mcp-find_rhymes".endswith("find_rhymes")` returns true.
 
-**Incremental Silver processing.** Silver uses a `LEFT ANTI JOIN` against existing UUIDs to process only new Bronze rows. Adding a new parquet shard to Bronze and rerunning Silver processes only the delta.
+## If This Were Production
 
-**Quarantine handling.** Records that fail JSON parsing are routed to a quarantine table instead of being silently dropped. Zero rows were quarantined in this dataset, but the mechanism is in place.
-
-**Automated DQ checks.** 11 checks validate data integrity across Bronze (null keys, empty messages, unique UUIDs), Silver (match rate ranges, no negative counts, row count reconciliation), and Gold (KPI population, count alignment).
-
-## Known Workarounds
-
-```python
-# Hugging Face datasets library conflicts with Databricks runtime 18.1
-# maxdepth error in HfFileSystem.find() — bypass by reading parquet directly
-df = spark.read.parquet("dbfs:/tmp/toucan_sft.parquet")  # ✅
-ds = load_dataset("Agent-Ark/Toucan-1.5M", ...)          # ❌ maxdepth error
-
-# Local disk vs DBFS — Spark can't read from /tmp/ directly
-dbutils.fs.cp("file:/tmp/file.parquet", "dbfs:/tmp/file.parquet")  # ✅
-spark.read.parquet("/tmp/file.parquet")                             # ❌ PATH_NOT_FOUND
-
-# Tool name prefix mismatch — actual calls include MCP server prefix
-# tools_used: "lyrical-mcp-find_rhymes"  vs  target_tools: "find_rhymes"
-# Fix: use endsWith() matching instead of exact array_intersect
-used.endswith(target)  # ✅ matches "lyrical-mcp-find_rhymes" to "find_rhymes"
-F.array_intersect()    # ❌ returns zero matches due to prefix mismatch
-```
-
-## Production Improvements
-
-If this were a production system, the following would be added:
-
-- **Delta MERGE** for upsert logic instead of append-based incremental loading
-- **Delta table partitioning** by `subset_name` or `ingest_date` for query performance at scale
-- **DLT (Delta Live Tables)** with built-in expectations for declarative DQ
-- **Streaming ingestion** for real-time trace processing via Auto Loader
-- **Alerting** via Databricks SQL Alerts when zero-match rate exceeds thresholds
-- **TRAIL dataset integration** for error categorization and failure taxonomy enrichment
-- **Additional Toucan subsets** (Kimi-K2, Qwen3, OSS) to scale to 1.6M+ rows
+Things I'd add with more time: Delta MERGE for true upsert logic instead of append-based incremental loading. Table partitioning by `subset_name` for query performance at scale. Delta Live Tables with built-in expectations for declarative DQ. Streaming ingestion via Auto Loader for real-time trace processing. SQL Alerts when zero-match rate exceeds a threshold. Integration with the TRAIL dataset for error categorization. Loading the remaining Toucan subsets (Kimi-K2, Qwen3, OSS) to scale to 1.6M+ rows.
 
 ## Stack
 
-Databricks · Delta Lake · PySpark · Unity Catalog · Databricks Workflows · Databricks AI/BI Dashboard
+Databricks · Unity Catalog · Delta Lake · PySpark · Databricks Workflows · Databricks AI/BI Dashboard
+
+## Data Source
+
+[Toucan-1.5M](https://huggingface.co/datasets/Agent-Ark/Toucan-1.5M) by Agent-Ark — SFT subset (119,287 trajectories from 3 parquet shards). Apache 2.0 license.
