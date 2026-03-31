@@ -50,6 +50,8 @@ At the bottom, a data quality summary table showing all checks passing across 1.
 
 ![Dashboard](screenshots/dashboard.png)
 
+Dashboard LiveLink:https://dbc-7b106152-caf3.cloud.databricks.com/dashboardsv3/01f12c8b17341254a7994a4784ab5726/published/pages/3c98e78c?o=1352785079224954
+
 ## Engineering Decisions
 
 **Why idempotent ingestion?** Each parquet shard gets a unique `source` label (e.g., `toucan_sft_0001`). Before writing, the notebook checks if that label already exists in Bronze. This means the pipeline is safe to rerun — it won't duplicate data. Proven when cluster restarts required rerunning notebooks mid-pipeline.
